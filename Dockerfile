@@ -14,7 +14,11 @@
 # the image per machine, so the pull is paid once per host rather than once per job.
 #
 # Licences: LongCat-Video is MIT. ComfyUI is GPL-3.0 and is used here as an unmodified upstream program.
-FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel
+# The runtime base rather than devel: nothing here compiles. The 80 GB build needs nvcc because it may
+# have to build flash-attn; this one does not use flash-attn at all and runs sdpa through ComfyUI. Devel
+# costs several gigabytes on every pull, and with ~24 GB of weights already in the image that is not
+# free -- the first worker on a fresh machine pays the whole pull before it can serve anything.
+FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -68,7 +72,7 @@ PY
 # Proven at build time rather than on the first paid request.
 RUN ls -l /ComfyUI/models/diffusion_models/LongCat /ComfyUI/models/loras /ComfyUI/models/text_encoders /ComfyUI/models/vae \
  && ffmpeg -hide_banner -h encoder=libx264 > /dev/null \
- && python -c "import torch; print('torch', torch.__version__)"
+ && python -c "import torch; print('torch', torch.__version__, '| fp8', torch.float8_e4m3fn)"  && du -sh /ComfyUI/models
 
 ENV COMFY_DIR=/ComfyUI
 COPY handler.py /handler.py
