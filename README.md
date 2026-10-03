@@ -21,11 +21,16 @@ hour pulling the first time a worker lands on a new machine. They live on a netw
    flash-attn 2.7.4.post1, a stack with no `sm_120` kernels, so the RTX PRO 6000 Blackwell 96 GB cannot run
    this image at all -- it will download the weights and then fail every generation with "no kernel image is
    available for execution on the device". That is the only card above `Low` stock anywhere, and it is the one
-   card to avoid. `gpuIds` is therefore `AMPERE_80` (A100 80 GB), which is what the pinned stack supports.
+   card to avoid. `gpuIds` is therefore `ADA_80_PRO,HOPPER_141` -- H100 80 GB and H200 141 GB. Both are
+   `sm_90`, so the same image runs on either unmodified, and H100 is roughly two to three times an A100 on
+   bf16, which shortens the wall clock the execution timeout is measured against.
 
-   As of writing `EU-RO-1` is the best home: it is the only storage datacentre carrying two compatible cards,
-   A100 80 GB PCIe and A100 SXM 80 GB, so a job has two chances of a worker rather than one. Running the
-   Blackwell would mean moving to torch 2.8 + cu12.8 and a newer flash-attn, away from the project's pins.
+   As of writing `EU-FR-1` is the best home: it carries both of those cards, so a job has two chances of a
+   worker rather than one, and it keeps generation in the EU. A100 (`AMPERE_80`) also works and is cheaper
+   per hour, but lives in fewer datacentres and never more than one variant in any one of them. Every
+   compatible card on the platform is `Low` stock, so two options in one datacentre is the best posture
+   available. Running the Blackwell would mean moving to torch 2.8 + cu12.8 and a newer flash-attn, away
+   from the project's pins.
 
    Put the studio's uploads on this same volume. An endpoint mounts exactly one, so inputs for
    image-to-video and continuation have to live on the volume the worker already has.

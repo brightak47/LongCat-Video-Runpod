@@ -12,7 +12,7 @@
     }
   ],
   "config": {
-    "gpuTypeId": "NVIDIA A100 80GB PCIe",
+    "gpuTypeId": "NVIDIA H100 80GB HBM3",
     "gpuCount": 1,
     "containerDiskInGb": 30
   }
