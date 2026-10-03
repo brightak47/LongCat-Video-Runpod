@@ -1,11 +1,19 @@
-# LongCat-Video as a RunPod serverless worker.
+# LongCat-Video as a RunPod serverless worker, fp8 on a 24 GB card.
 #
-# The weights are NOT in this image. The base checkpoint is 83 GB, and an image that size takes most of an hour
-# to pull the first time a worker starts on a new machine -- we measured ~50 minutes on a 177 GB image. They live
-# on a network volume instead, mounted at /runpod-volume, which also means the model can be updated without
-# rebuilding anything. See download_weights.py for populating it.
+# The point of this build is the card it runs on. The official pipeline needs an 80 GB GPU, and on RunPod every
+# 80 GB card is Low stock in every datacentre that also supports network volumes -- so jobs queue for hardware
+# rather than running. Kijai's fp8 conversion of the same checkpoint is 15.5 GB against 27.2 GB at bf16, which
+# fits a 4090 alongside its activations, and ADA_24 is the one tier with real capacity.
 #
-# Licence: LongCat-Video is MIT.
+# fp8_e4m3fn is a native tensor-core format on Ada (compute 8.9), so this is not only smaller: WanVideoWrapper's
+# `_fast` quantization modes do the matmul in fp8. That is the difference between this and the INT8 path in the
+# upstream repo, which dequantizes to bf16 on every forward and therefore saves memory while costing speed.
+#
+# The weights are baked in, deliberately. They total ~24 GB, which is a large image but means no network volume:
+# no datacentre pinning, no separate setup step, and a worker can start anywhere a 4090 is free. RunPod caches
+# the image per machine, so the pull is paid once per host rather than once per job.
+#
+# Licences: LongCat-Video is MIT. ComfyUI is GPL-3.0 and is used here as an unmodified upstream program.
 FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel
 
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1
@@ -13,36 +21,55 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       git wget curl ffmpeg libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
-RUN git clone --depth 1 https://github.com/meituan-longcat/LongCat-Video.git /app/LongCat-Video
-WORKDIR /app/LongCat-Video
+WORKDIR /
+RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git /ComfyUI
+WORKDIR /ComfyUI
+RUN pip install --no-cache-dir -r requirements.txt
 
-# flash-attn from the project's own prebuilt wheel rather than from source. Building it here takes 30-90 minutes
-# of compile time against a Hub build that is not allowed to run that long, and the wheel is the same artefact.
-# The fallback exists because the wheel's name encodes the exact torch/python/ABI triple: if the base image ever
-# moves, the build falls back to compiling instead of failing silently on a wheel that does not apply.
-ARG FLASH_WHEEL=https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
-RUN pip install --no-cache-dir "$FLASH_WHEEL" \
- || (echo "prebuilt flash-attn wheel did not apply; compiling" \
-     && MAX_JOBS=4 pip install --no-cache-dir --no-build-isolation flash-attn==2.7.4.post1)
+# The three node packs Kijai's own LongCat workflow is built from. Pinned to nothing on purpose: these move
+# quickly and the graph this worker builds is checked against the live schema at startup (see handler.py), which
+# catches a rename as a clear error on boot instead of a confusing failure mid-job.
+RUN git clone --depth 1 https://github.com/kijai/ComfyUI-WanVideoWrapper.git custom_nodes/ComfyUI-WanVideoWrapper \
+ && git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git custom_nodes/ComfyUI-KJNodes \
+ && git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git custom_nodes/ComfyUI-VideoHelperSuite \
+ && pip install --no-cache-dir \
+      -r custom_nodes/ComfyUI-WanVideoWrapper/requirements.txt \
+      -r custom_nodes/ComfyUI-KJNodes/requirements.txt \
+      -r custom_nodes/ComfyUI-VideoHelperSuite/requirements.txt \
+ && pip install --no-cache-dir runpod requests boto3 "huggingface_hub>=0.23,<1.0"
 
-# The project's pins, minus torch (the base image has it) and streamlit (its demo UI is not wanted here).
-RUN grep -vE '^(torch==|streamlit==)' requirements.txt > /tmp/req.txt \
- && pip install --no-cache-dir -r /tmp/req.txt \
- && pip install --no-cache-dir runpod requests boto3 "huggingface_hub>=0.23,<1.0" \
- && python -c "import torch, flash_attn, diffusers, transformers; print('torch', torch.__version__, '| flash-attn', flash_attn.__version__, '| diffusers', diffusers.__version__)"
+# Weights. Each is fetched by exact filename rather than by snapshot, so a new file appearing upstream cannot
+# silently change what this image contains.
+ARG HF=https://huggingface.co
+RUN python - <<'PY'
+from huggingface_hub import hf_hub_download
+import pathlib, shutil
 
-# Proven at build time rather than on the first paid request: a missing module in this import list is the whole
-# difference between a worker that starts and one that fails every job with a traceback nobody sees.
-RUN python -c "\
-from longcat_video.pipeline_longcat_video import LongCatVideoPipeline; \
-from longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan; \
-from longcat_video.modules.longcat_video_dit import LongCatVideoTransformer3DModel; \
-from longcat_video.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler; \
-from longcat_video.context_parallel.context_parallel_util import init_context_parallel; \
-print('longcat imports ok')"
+WANTED = [
+    # (repo, filename, destination under /ComfyUI/models)
+    ("Kijai/LongCat-Video_comfy", "LongCat_TI2V_comfy_fp8_e4m3fn_scaled_KJ.safetensors", "diffusion_models/LongCat"),
+    # The distilled schedule: 10 steps at cfg 1.0 instead of 50 at cfg 4.0, which is what makes this affordable.
+    ("Kijai/LongCat-Video_comfy", "LongCat_distill_lora_alpha64_bf16.safetensors", "loras"),
+    # fp8 text encoder rather than bf16: 6.7 GB instead of 11, and it is loaded and freed per prompt anyway.
+    ("Kijai/WanVideo_comfy", "umt5-xxl-enc-fp8_e4m3fn.safetensors", "text_encoders"),
+    ("Kijai/WanVideo_comfy", "Wan2_1_VAE_bf16.safetensors", "vae"),
+]
+for repo, name, sub in WANTED:
+    target = pathlib.Path("/ComfyUI/models") / sub
+    target.mkdir(parents=True, exist_ok=True)
+    got = hf_hub_download(repo_id=repo, filename=name)
+    shutil.copy2(got, target / pathlib.Path(name).name)
+    size = (target / pathlib.Path(name).name).stat().st_size / 1e9
+    print(f"{name} -> {target} ({size:.1f} GB)", flush=True)
+    # The HF cache holds a second copy; this image is large enough already.
+    shutil.rmtree(pathlib.Path(got).parents[2], ignore_errors=True)
+PY
 
-ENV CHECKPOINT_DIR=/runpod-volume/weights/LongCat-Video
-COPY download_weights.py /app/LongCat-Video/download_weights.py
-COPY handler.py /app/LongCat-Video/handler.py
-CMD ["python", "-u", "handler.py"]
+# Proven at build time rather than on the first paid request.
+RUN ls -l /ComfyUI/models/diffusion_models/LongCat /ComfyUI/models/loras /ComfyUI/models/text_encoders /ComfyUI/models/vae \
+ && ffmpeg -hide_banner -h encoder=libx264 > /dev/null \
+ && python -c "import torch; print('torch', torch.__version__)"
+
+ENV COMFY_DIR=/ComfyUI
+COPY handler.py /handler.py
+CMD ["python", "-u", "/handler.py"]

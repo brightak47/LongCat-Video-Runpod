@@ -1,24 +1,44 @@
 {
-  "title": "LongCat-Video",
-  "description": "Text-to-video, image-to-video and video continuation with Meituan's LongCat-Video (13.6B, MIT). Weights load from an attached network volume, so this image stays small and cold starts are minutes rather than an hour.",
+  "title": "LongCat-Video fp8 (24GB)",
+  "description": "LongCat-Video (Meituan, 13.6B, MIT) in fp8 on a 24 GB card: text-to-video, image-to-video and long video by continuation. Weights are in the image, so there is no network volume and no datacentre pinning -- a worker starts wherever a 4090 is free.",
   "type": "serverless",
   "category": "video",
   "iconUrl": "https://avatars.githubusercontent.com/u/180650897",
   "config": {
     "runsOn": "GPU",
-    "containerDiskInGb": 30,
-    "gpuIds": "ADA_80_PRO,HOPPER_141",
+    "containerDiskInGb": 50,
+    "gpuIds": "ADA_24,ADA_48_PRO,AMPERE_80",
     "gpuCount": 1,
     "presets": [],
     "env": [
       {
-        "key": "CHECKPOINT_DIR",
-        "value": "/runpod-volume/weights/LongCat-Video",
+        "key": "LONGCAT_QUANTIZATION",
+        "value": "fp8_e4m3fn_scaled_fast",
         "input": {
-          "name": "Checkpoint directory",
+          "name": "Quantization mode",
           "type": "string",
-          "default": "/runpod-volume/weights/LongCat-Video",
-          "description": "Where the weights were downloaded on the attached volume."
+          "default": "fp8_e4m3fn_scaled_fast",
+          "description": "fp8 matmul needs compute capability 8.9 (RTX 4000 series and up). Set to 'disabled' on an older card to let the loader autoselect."
+        }
+      },
+      {
+        "key": "LONGCAT_BLOCK_SWAP",
+        "value": "0",
+        "input": {
+          "name": "Blocks to swap",
+          "type": "string",
+          "default": "0",
+          "description": "Transformer blocks held on CPU. 0 on a 24 GB card; raise toward 20 if generation runs out of memory, which trades speed for headroom."
+        }
+      },
+      {
+        "key": "LONGCAT_ATTENTION",
+        "value": "sdpa",
+        "input": {
+          "name": "Attention mode",
+          "type": "string",
+          "default": "sdpa",
+          "description": "sdpa is built in. sageattn is faster but needs the extra package installed."
         }
       },
       {
@@ -27,7 +47,7 @@
           "name": "R2 account id",
           "type": "string",
           "default": "",
-          "description": "Optional. Set the R2 group to have finished videos uploaded and a signed URL returned."
+          "description": "Needed for anything longer than a few seconds: a long video cannot be returned inside the response, and this worker keeps no volume."
         }
       },
       {

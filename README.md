@@ -1,61 +1,23 @@
-# LongCat-Video on RunPod serverless
+# LongCat-Video on RunPod serverless, fp8 on a 24 GB card
 
-[LongCat-Video](https://github.com/meituan-longcat/LongCat-Video) (Meituan, 13.6B, MIT) as a serverless
-worker: text-to-video, image-to-video and video continuation, including long video by continuation.
+[LongCat-Video](https://github.com/meituan-longcat/LongCat-Video) (Meituan, 13.6B, MIT) as a serverless worker:
+text-to-video, image-to-video, and long video by continuation.
 
-The weights are **not** in the image. The base checkpoint is 83 GB, and an image that size spends most of an
-hour pulling the first time a worker lands on a new machine. They live on a network volume mounted at
-`/runpod-volume` instead, which also means the model can be replaced without rebuilding anything.
+**The card it runs on is the point.** The official pipeline needs 80 GB, and on RunPod every 80 GB card is
+`Low` stock in every datacentre that also supports network volumes — so jobs queue for hardware instead of
+running. [Kijai's fp8 conversion](https://huggingface.co/Kijai/LongCat-Video_comfy) of the same checkpoint is
+15.5 GB against 27.2 GB at bf16, which fits a 4090 alongside its activations.
 
-## Setting it up
+`fp8_e4m3fn` is a native tensor-core format on Ada (compute 8.9), so this is not only smaller: WanVideoWrapper's
+`_fast` quantization modes do the matmul in fp8. That is the difference between this and the INT8 path in the
+upstream repo, which dequantizes to bf16 on every forward and so saves memory while costing speed.
 
-1. **A network volume**, 150 GB, in a datacentre that actually has 80 GB GPUs *in stock*. Few have both, and
-   the volume pins the endpoint to its datacentre, so the wrong choice gives an endpoint whose jobs never get a
-   worker. Check before creating it:
+**No network volume.** The ~24 GB of weights are in the image, which means no datacentre pinning, no separate
+setup step, and a worker that starts wherever a 4090 is free. RunPod caches the image per machine, so the pull
+is paid once per host.
 
-   ```graphql
-   query { dataCenters { id storageSupport gpuAvailability { gpuTypeId available stockStatus } } }
-   ```
-
-   **Which card matters more than how much of it there is.** LongCat pins torch 2.6.0 + CUDA 12.4 and
-   flash-attn 2.7.4.post1, a stack with no `sm_120` kernels, so the RTX PRO 6000 Blackwell 96 GB cannot run
-   this image at all -- it will download the weights and then fail every generation with "no kernel image is
-   available for execution on the device". That is the only card above `Low` stock anywhere, and it is the one
-   card to avoid. `gpuIds` is therefore `ADA_80_PRO,HOPPER_141` -- H100 80 GB and H200 141 GB. Both are
-   `sm_90`, so the same image runs on either unmodified, and H100 is roughly two to three times an A100 on
-   bf16, which shortens the wall clock the execution timeout is measured against.
-
-   As of writing `EU-FR-1` is the best home: it carries both of those cards, so a job has two chances of a
-   worker rather than one, and it keeps generation in the EU. A100 (`AMPERE_80`) also works and is cheaper
-   per hour, but lives in fewer datacentres and never more than one variant in any one of them. Every
-   compatible card on the platform is `Low` stock, so two options in one datacentre is the best posture
-   available. Running the Blackwell would mean moving to torch 2.8 + cu12.8 and a newer flash-attn, away
-   from the project's pins.
-
-   Put the studio's uploads on this same volume. An endpoint mounts exactly one, so inputs for
-   image-to-video and continuation have to live on the volume the worker already has.
-
-2. **Populate it once**, by asking the endpoint to do it:
-
-   ```json
-   { "input": { "mode": "setup" } }
-   ```
-
-   Repeat until the reply says `"complete": true`. It is resumable, reports the gigabytes it has, and stops at
-   its time budget rather than being killed by the execution timeout — 83 GB is longer than one job should run.
-   Add `"avatar": true` to fetch the avatar model instead.
-
-   The documented alternative is a pod with the volume mounted, running `download_weights.py` directly. That is
-   worth knowing about and did not work here: pods were rented and billed with their container never starting
-   (`RUNNING`, `uptimeInSeconds: 0`, no ports) across two datacentres and two GPU types, while serverless
-   workers on the same account start normally. Hence `mode: "setup"`.
-
-   Note for anyone using a pod anyway: a pod mounts the volume at its `volumeMountPath`, which defaults to
-   `/workspace`. Only serverless sees it at `/runpod-volume`, so pass `volumeMountPath: "/runpod-volume"` or the
-   download lands on the container disk and runs out of room.
-
-3. **Deploy from the RunPod Hub**, attach the volume, and raise the endpoint's execution timeout — the default
-   is 10 minutes and a long video is not.
+The 80 GB build is kept under [`official-pipeline/`](official-pipeline/) as a fallback — it uses Meituan's own
+pipeline and loads bf16 weights from a volume.
 
 ## Asking for a video
 
@@ -68,36 +30,49 @@ hour pulling the first time a worker lands on a new machine. They live on a netw
 | `mode` | `t2v` (default), `i2v`, `continue` |
 | `prompt`, `negative_prompt` | a default negative prompt is applied when none is given |
 | `image_url` / `image_b64` | the first frame, for `i2v` |
-| `video_url` / `video_b64` | the clip to extend, for `continue` |
-| `seconds` or `segments` | how much video to make. One segment is 93 frames; each extra adds ~5.3 s |
-| `resolution` | `480p` (default) or `720p` |
-| `width`, `height` | `t2v` only, both divisible by 16 (default 832x480) |
-| `quality` | `fast` (16 distilled steps, default) or `standard` (50 steps, ~3x the GPU) |
-| `seed`, `steps`, `guidance_scale` | overrides, if you want them |
-| `refine` | a second 720p pass that also doubles the frame rate to 30. Expensive; off by default |
-| `time_budget_sec` | stop generating and bank what exists, default 2700 |
+| `video_url` / `video_b64` | the clip to carry on from, for `continue` |
+| `seconds` or `segments` | how much video. One segment is 93 frames; each extra adds 80 more (~5.3 s) |
+| `width`, `height` | default 832×480, both divisible by 16 |
+| `steps`, `cfg`, `shift`, `seed` | overrides. Defaults are the distilled schedule: 10 steps, cfg 1.0, shift 12 |
+| `blocks_to_swap` | transformer blocks held on CPU. 0 on a 24 GB card; raise toward 20 if memory runs out |
+| `time_budget_sec` | give up after this, default 2700 |
 
-Output carries `frames`, `fps`, `seconds`, `segments_done`, `complete` and `gpu_seconds`, plus a `video_url`
-(when a bucket is configured), a `video_path` on the volume, or `video_b64` for small results.
+Output carries `frames`, `fps`, `seconds`, `segments_done`, `gpu_seconds` and a `video_url` (or `video_b64`
+for short results), plus `continue_from`.
 
 ## Long video
 
-LongCat makes long video by continuation: 93 frames at a time, each segment conditioned on the tail of the
-last. A minute is eleven segments and half an hour is over three hundred — more than one serverless job may
-run for.
+LongCat extends a clip 93 frames at a time, each pass conditioned on the previous segment's last 13 frames. A
+minute is eleven passes; ten minutes is a hundred and thirteen.
 
-So the worker generates until `time_budget_sec` is spent, writes the tail of what it has to the volume, and
-returns `"complete": false` with a `resume_key`. Pass that key back and it continues from exactly there:
+Within one job the segments are **unrolled into a single ComfyUI graph**, so the frames never leave the process
+— round-tripping them through disk would mean a VAE encode and decode per segment, which at 480p is minutes of
+pointless work per pass.
+
+Across jobs, continuation goes **through the bucket**, because this worker deliberately has no volume and so
+nothing survives between jobs:
 
 ```json
-{ "input": { "mode": "continue", "resume_key": "a1b2c3…", "prompt": "…", "segments": 40 } }
+{ "input": { "mode": "continue", "video_url": "<the previous job's video_url>", "prompt": "…", "segments": 20 } }
 ```
 
-The caller stitches the pieces. This is the only way a half-hour video is possible at all, and it means a
-failure costs one chunk rather than the whole thing.
+That also means a failure costs one chunk rather than the whole video. An `R2_BUCKET` is effectively required
+for anything beyond a few seconds: a ten-minute video cannot be returned inside a response.
+
+## Settings that are not guesses
+
+The schedule and the overlap come from Kijai's own `LongCat_TI2V_example_01.json`, not from estimation:
+**10 steps, cfg 1.0, shift 12.0, scheduler `longcat_distill_euler`**, overlap 13, 93 frames at 15 fps, with the
+distilled LoRA loaded. The undistilled path is 50 steps at cfg 4.0 and costs roughly five times as much for no
+benefit once that LoRA is in place.
+
+Every node the handler builds a graph from is checked against the live `/object_info` when the worker boots.
+These node packs move quickly, and a rename should be a clear error on startup rather than a puzzling failure
+halfway through a paid job.
 
 ## Costs
 
-Driven almost entirely by GPU seconds on an 80 GB card. `quality: "fast"` uses the distilled 16-step schedule
-and is roughly a third of the standard 50-step cost for most content, so it is the default; `refine` is
-another full 50-step pass over every frame and should be asked for deliberately.
+Driven by GPU seconds on a 24 GB card. Reported third-party figures for this stack are 2–3 minutes per segment
+on an **RTX 3060**, which implies well under a minute per segment on a 4090 — but nothing here has been measured
+on our own hardware yet, and that is the first thing to do once the endpoint is up. Ask for `segments: 1` and
+read `gpu_seconds`; everything else is multiplication.

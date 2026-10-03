@@ -1,19 +1,18 @@
 {
   "tests": [
     {
-      "name": "text_to_video",
+      "name": "one_segment_text_to_video",
       "input": {
         "mode": "t2v",
         "prompt": "realistic filming style, a hot air balloon rising slowly over green hills at sunrise, the camera tracking it from below",
-        "quality": "fast",
-        "segments": 0
+        "segments": 1
       },
-      "timeout": 1800
+      "timeout": 2400
     }
   ],
   "config": {
-    "gpuTypeId": "NVIDIA H100 80GB HBM3",
+    "gpuTypeId": "NVIDIA GeForce RTX 4090",
     "gpuCount": 1,
-    "containerDiskInGb": 30
+    "containerDiskInGb": 50
   }
 }
