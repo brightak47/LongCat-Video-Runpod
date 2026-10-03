@@ -1,0 +1,11 @@
+# Where ComfyUI finds the LongCat weights.
+#
+# They live on the network volume rather than in the image: a ~35 GB image with the weights baked in never
+# finished pulling, leaving workers in `initializing` for over an hour. Populate the volume once per endpoint
+# with {"input": {"mode": "setup"}}.
+comfyui:
+    base_path: /runpod-volume/models/
+    diffusion_models: diffusion_models
+    loras: loras
+    text_encoders: text_encoders
+    vae: vae

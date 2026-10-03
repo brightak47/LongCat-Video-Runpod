@@ -1,12 +1,12 @@
 {
   "title": "LongCat-Video fp8 (24GB)",
-  "description": "LongCat-Video (Meituan, 13.6B, MIT) in fp8 on a 24 GB card: text-to-video, image-to-video and long video by continuation. Weights are in the image, so there is no network volume and no datacentre pinning -- a worker starts wherever a 4090 is free.",
+  "description": "LongCat-Video (Meituan, 13.6B, MIT) in fp8 on a 24 GB card: text-to-video, image-to-video and long video by continuation. Needs a network volume for the weights; populate it once with {\"input\": {\"mode\": \"setup\"}}.",
   "type": "serverless",
   "category": "video",
   "iconUrl": "https://avatars.githubusercontent.com/u/180650897",
   "config": {
     "runsOn": "GPU",
-    "containerDiskInGb": 50,
+    "containerDiskInGb": 30,
     "gpuIds": "ADA_24,ADA_48_PRO,AMPERE_80",
     "gpuCount": 1,
     "presets": [],

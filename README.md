@@ -12,9 +12,20 @@ running. [Kijai's fp8 conversion](https://huggingface.co/Kijai/LongCat-Video_com
 `_fast` quantization modes do the matmul in fp8. That is the difference between this and the INT8 path in the
 upstream repo, which dequantizes to bf16 on every forward and so saves memory while costing speed.
 
-**No network volume.** The ~24 GB of weights are in the image, which means no datacentre pinning, no separate
-setup step, and a worker that starts wherever a 4090 is free. RunPod caches the image per machine, so the pull
-is paid once per host.
+**The weights are on a network volume, not in the image** — and that is a correction. Baking them in removed
+the need for a volume and looked like the whole operational win: a worker could start wherever a 4090 was free.
+In practice the ~35 GB image never finished pulling; workers sat in `initializing` for over an hour with
+`unhealthy: 0`, which is a pull that cannot complete rather than a container that crashes.
+
+So: a small image, a volume, and one `setup` call per endpoint.
+
+```json
+{ "input": { "mode": "setup" } }
+```
+
+It fetches the four files by exact name, skips any already present, and is resumable. Put the volume in
+**EU-RO-1**, which carries the only 4090s above `Low` stock found anywhere, so most of the availability this
+design was meant to buy survives the pinning.
 
 The 80 GB build is kept under [`official-pipeline/`](official-pipeline/) as a fallback — it uses Meituan's own
 pipeline and loads bf16 weights from a volume.

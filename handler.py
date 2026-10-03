@@ -1,7 +1,7 @@
 """RunPod serverless worker for LongCat-Video in fp8, driving ComfyUI + WanVideoWrapper.
 
 Input (job["input"]):
-    mode            "t2v" (default) | "i2v" | "continue"
+    mode            "t2v" (default) | "i2v" | "continue" | "setup"
     prompt          required for t2v and i2v
     negative_prompt optional; a default is applied
     image_url | image_b64     the first frame, for i2v
@@ -28,6 +28,14 @@ Long video:
     Continuation across jobs therefore goes through the bucket: a job returns its video_url, and the caller
     passes that back as `video_url` with `mode: "continue"`. Nothing is kept on the worker between jobs, which
     is also why a failure costs one chunk rather than the whole video.
+
+Populating the volume:
+    Call {"input": {"mode": "setup"}} once per endpoint. It downloads the four model files onto the attached
+    network volume and verifies them, and it is resumable, so call it again if it stops at its time budget.
+
+    The weights are on a volume rather than in the image because a ~35 GB image with them baked in never
+    finished pulling: workers stayed in `initializing` for over an hour with `unhealthy: 0`, which is a pull
+    that cannot complete rather than a container that crashes.
 
 Why fp8 rather than the official pipeline:
     The upstream pipeline needs 80 GB, and on RunPod every 80 GB card is Low stock in every datacentre that
@@ -96,8 +104,69 @@ REQUIRED_NODES = [
 ]
 
 
+# What the volume must hold, and where. The subfolders match extra_model_paths.yaml.
+WEIGHTS = [
+    ("Kijai/LongCat-Video_comfy", "LongCat_TI2V_comfy_fp8_e4m3fn_scaled_KJ.safetensors", "diffusion_models/LongCat", 15.5),
+    # The distilled schedule: 10 steps at cfg 1.0 instead of 50 at cfg 4.0, which is what makes this affordable.
+    ("Kijai/LongCat-Video_comfy", "LongCat_distill_lora_alpha64_bf16.safetensors", "loras", 1.3),
+    # fp8 text encoder rather than bf16: 6.7 GB instead of 11, and it is loaded and freed per prompt anyway.
+    ("Kijai/WanVideo_comfy", "umt5-xxl-enc-fp8_e4m3fn.safetensors", "text_encoders", 6.7),
+    ("Kijai/WanVideo_comfy", "Wan2_1_VAE_bf16.safetensors", "vae", 0.6),
+]
+MODELS_DIR = VOLUME_DIR / "models"
+
+
 class InputError(Exception):
     """Something wrong with the request rather than the worker."""
+
+
+def setup(job_input: dict) -> dict:
+    """
+    Put the model files on the attached volume.
+
+    Each file is fetched by exact name rather than as a repository snapshot, so a new file appearing upstream
+    cannot silently change what this worker runs. Already-complete files are skipped, which is what makes a
+    second call cheap if the first ran out of time.
+    """
+    from huggingface_hub import hf_hub_download
+
+    if not VOLUME_DIR.is_dir():
+        return {"error": "no volume is attached at /runpod-volume, so there is nowhere to put the weights"}
+
+    budget = float(job_input.get("time_budget_sec") or 2400)
+    started = time.time()
+    report, complete = [], True
+    for repo, name, sub, expected_gb in WEIGHTS:
+        destination = MODELS_DIR / sub / name
+        if destination.is_file() and destination.stat().st_size > expected_gb * 0.9 * 1e9:
+            report.append({"file": name, "state": "present", "gigabytes": round(destination.stat().st_size / 1e9, 2)})
+            continue
+        if time.time() - started > budget:
+            report.append({"file": name, "state": "not reached, call setup again"})
+            complete = False
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fetched = hf_hub_download(repo_id=repo, filename=name)
+            shutil.copy2(fetched, destination)
+            # The download cache holds a second copy and the container disk is not large.
+            shutil.rmtree(Path(fetched).parents[2], ignore_errors=True)
+            report.append({"file": name, "state": "downloaded", "gigabytes": round(destination.stat().st_size / 1e9, 2)})
+        except Exception as exc:  # noqa: BLE001 - report which file and why, then carry on with the rest
+            report.append({"file": name, "state": f"failed: {exc}"})
+            complete = False
+
+    free = shutil.disk_usage(MODELS_DIR).free / 1e9 if MODELS_DIR.is_dir() else 0
+    # ComfyUI reads the model directory listing when it starts, so a worker that was already running would not
+    # see files that arrived afterwards.
+    global _comfy
+    if complete and _comfy is not None:
+        _comfy.terminate()
+        _comfy = None
+
+    return {"mode": "setup", "models_dir": str(MODELS_DIR), "files": report,
+            "free_gigabytes": round(free, 1), "complete": complete,
+            "elapsed": round(time.time() - started, 1)}
 
 
 _comfy = None
@@ -364,11 +433,20 @@ def handler(job):
     started = time.time()
 
     try:
-        start_comfy()
-
         mode = str(job_input.get("mode", "t2v"))
+        # Handled before ComfyUI is started, because setup is what runs when there are no models yet.
+        if mode == "setup":
+            return setup(job_input)
         if mode not in {"t2v", "i2v", "continue"}:
-            raise InputError(f"unknown mode {mode!r}; use t2v, i2v or continue")
+            raise InputError(f"unknown mode {mode!r}; use t2v, i2v, continue or setup")
+
+        missing = [n for _, n, sub, _ in WEIGHTS if not (MODELS_DIR / sub / n).is_file()]
+        if missing:
+            raise InputError(
+                "the volume is missing " + ", ".join(missing)
+                + '. Run {"input": {"mode": "setup"}} once for this endpoint.'
+            )
+        start_comfy()
         if mode in {"t2v", "i2v"} and not str(job_input.get("prompt") or "").strip():
             raise InputError("prompt is required for t2v and i2v")
 
