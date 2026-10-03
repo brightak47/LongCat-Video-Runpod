@@ -1,11 +1,11 @@
 """RunPod serverless worker for LongCat-Video (text-to-video, image-to-video, continuation).
 
 Input (job["input"]):
-    mode            "t2v" (default) | "i2v" | "continue"
+    mode            "t2v" (default) | "i2v" | "continue" | "setup"
     prompt          required for t2v/i2v; optional for continue
     negative_prompt optional, a sensible default is applied
-    image_url | image_b64       the first frame, for i2v
-    video_url | video_b64       the clip to continue, for continue
+    image_path | image_url | image_b64    the first frame, for i2v
+    video_path | video_url | video_b64    the clip to continue, for continue
     resume_key      continue a job this worker produced earlier (see "Long video" below)
 
     segments        extra continuation segments to append, default 0. Each adds ~5.3 s of video.
@@ -32,6 +32,16 @@ Long video:
     job may run for. So this worker generates until `time_budget_sec` is spent, writes the tail of what it has to
     the network volume, and returns `resume_key` with "complete": false. Calling it again with that key continues
     from exactly there. The caller stitches, or asks for the segments it wants and stitches once at the end.
+
+Populating the volume:
+    Call with {"mode": "setup"} and the worker downloads the checkpoint onto its own volume, reporting what it
+    managed. It is resumable, so call it again until it answers "complete": true -- the download is 83 GB and
+    longer than one job may run for.
+
+    This exists because a RunPod *pod* with the volume attached is the documented way to do it and, on this
+    account, pods are rented and billed without their container ever starting: status RUNNING, uptime 0, no
+    ports, in two different datacentres on two GPU types. Serverless workers do start, so the worker populates
+    its own volume rather than depending on a pod that may never run.
 
 Environment:
     CHECKPOINT_DIR   default /runpod-volume/weights/LongCat-Video
@@ -152,8 +162,17 @@ def _fetch(url: str, dest: Path) -> Path:
 
 
 def _resolve_media(job_input: dict, kind: str, work: Path):
+    """kind is 'image' or 'video'; accepts <kind>_path on the volume, <kind>_url or <kind>_b64."""
     suffix = {"image": ".png", "video": ".mp4"}[kind]
     dest = work / f"input_{kind}{suffix}"
+    # A path on the attached volume is how the studio passes inputs: it uploads to the volume over S3 and sends
+    # the path, so nothing large travels through the request. Accepted first because it costs no transfer at all.
+    raw = job_input.get(f"{kind}_path")
+    if raw:
+        given = Path(str(raw))
+        if not given.is_file():
+            raise InputError(f"{kind}_path {raw!r} is not on this worker's volume")
+        return given
     if job_input.get(f"{kind}_url"):
         return _fetch(job_input[f"{kind}_url"], dest)
     if job_input.get(f"{kind}_b64"):
@@ -228,6 +247,58 @@ def segments_for(job_input: dict) -> int:
     return max(0, int(np.ceil((wanted_frames - SEGMENT_FRAMES) / NEW_FRAMES_PER_SEGMENT)))
 
 
+def bytes_on_disk(path: Path) -> int:
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) if path.is_dir() else 0
+
+
+def setup(job_input: dict) -> dict:
+    """
+    Download the checkpoint onto the attached volume, as far as the time budget allows.
+
+    Runs the same download_weights.py that a pod would, as a subprocess with a deadline: snapshot_download has
+    no notion of one, and being killed part-way through costs nothing because it resumes from what is already
+    there. So a caller repeats this until `complete`, and each call is a normal-length job rather than one
+    enormous one that the execution timeout would kill outright.
+    """
+    import subprocess
+
+    target = Path(CHECKPOINT_DIR)
+    weights_dir = target.parent
+    if not VOLUME_DIR.is_dir():
+        return {"error": "no volume is attached at /runpod-volume, so there is nowhere to put the weights"}
+
+    budget = int(job_input.get("time_budget_sec") or 2400)
+    started = time.time()
+    before = bytes_on_disk(target)
+
+    environment = {**os.environ, "WEIGHTS_DIR": str(weights_dir), "HF_HUB_ENABLE_HF_TRANSFER": "1"}
+    which = ["--only", "avatar-1.5"] if job_input.get("avatar") else ["--only", "base"]
+    try:
+        completed = subprocess.run(
+            ["python", "/app/LongCat-Video/download_weights.py", *which],
+            capture_output=True, text=True, timeout=budget, env=environment,
+        )
+        finished, tail = completed.returncode == 0, (completed.stderr or completed.stdout)[-1500:]
+    except subprocess.TimeoutExpired:
+        finished, tail = False, f"stopped at the {budget}s budget; call setup again to carry on"
+
+    after = bytes_on_disk(target)
+    missing = [s for s in ("tokenizer", "text_encoder", "vae", "scheduler", "dit") if not (target / s).is_dir()]
+    free = shutil.disk_usage(weights_dir).free / 1e9 if weights_dir.is_dir() else 0
+    return {
+        "mode": "setup",
+        "checkpoint_dir": str(target),
+        "gigabytes": round(after / 1e9, 2),
+        "gigabytes_this_call": round((after - before) / 1e9, 2),
+        "free_gigabytes": round(free, 1),
+        "missing_subfolders": missing,
+        # Complete means the pipeline can actually load it, not merely that the downloader exited cleanly.
+        "complete": finished and not missing,
+        "elapsed": round(time.time() - started, 1),
+        "note": tail,
+    }
+
+
 def handler(job):
     job_input = job.get("input") or {}
     started = time.time()
@@ -237,8 +308,11 @@ def handler(job):
         import torch
 
         mode = str(job_input.get("mode", "t2v"))
+        # Handled before the model is touched: setup is what runs when there is no model yet.
+        if mode == "setup":
+            return setup(job_input)
         if mode not in {"t2v", "i2v", "continue"}:
-            raise InputError(f"unknown mode {mode!r}; use t2v, i2v or continue")
+            raise InputError(f"unknown mode {mode!r}; use t2v, i2v, continue or setup")
 
         prompt = str(job_input.get("prompt") or "").strip()
         if mode in {"t2v", "i2v"} and not prompt:
@@ -282,7 +356,7 @@ def handler(job):
 
             path = _resolve_media(job_input, "image", work)
             if path is None:
-                raise InputError("i2v needs image_url or image_b64")
+                raise InputError("i2v needs image_path, image_url or image_b64")
             image = load_image(str(path))
             output = pipe.generate_i2v(image=image, prompt=prompt, negative_prompt=negative, resolution=resolution,
                                        num_frames=SEGMENT_FRAMES, **common)[0]
@@ -291,7 +365,7 @@ def handler(job):
         else:
             path = _resolve_media(job_input, "video", work)
             if path is None:
-                raise InputError("continue needs video_url, video_b64 or resume_key")
+                raise InputError("continue needs video_path, video_url, video_b64 or resume_key")
             frames = _read_video(path)
             if len(frames) < COND_FRAMES:
                 raise InputError(f"the clip to continue has {len(frames)} frames; at least {COND_FRAMES} are needed")

@@ -9,20 +9,36 @@ hour pulling the first time a worker lands on a new machine. They live on a netw
 
 ## Setting it up
 
-1. **A network volume**, 150 GB, in a datacentre that actually has 80 GB GPUs. Only some have both; as of
-   writing, `CA-MTL-3` is the one with A100 80 GB PCIe *and* volume support. The volume pins the endpoint to
-   its datacentre, so choosing one without the card gives an endpoint whose jobs never get a worker.
+1. **A network volume**, 150 GB, in a datacentre that actually has 80 GB GPUs *in stock*. Few have both, and
+   the volume pins the endpoint to its datacentre, so the wrong choice gives an endpoint whose jobs never get a
+   worker. Check before creating it:
 
-2. **Populate it once** from a pod with the volume attached:
-
-   ```bash
-   pip install 'huggingface_hub>=0.23,<1.0'
-   curl -sO https://raw.githubusercontent.com/brightak47/LongCat-Video-Runpod/main/download_weights.py
-   python download_weights.py            # base, ~83 GB
-   python download_weights.py --avatar-1.5   # the audio-driven avatar model, ~75 GB more
+   ```graphql
+   query { dataCenters { id storageSupport gpuAvailability { gpuTypeId available stockStatus } } }
    ```
 
-   A CPU pod is enough and costs a few cents an hour; nothing here needs a GPU.
+   As of writing `EUR-IS-1` is the only storage datacentre with any 80 GB-class card above `Low` stock (the
+   RTX PRO 6000 Blackwell 96 GB at `Medium`). A100 80 GB PCIe exists only in `CA-MTL-3`, where it could not
+   actually be allocated.
+
+2. **Populate it once**, by asking the endpoint to do it:
+
+   ```json
+   { "input": { "mode": "setup" } }
+   ```
+
+   Repeat until the reply says `"complete": true`. It is resumable, reports the gigabytes it has, and stops at
+   its time budget rather than being killed by the execution timeout — 83 GB is longer than one job should run.
+   Add `"avatar": true` to fetch the avatar model instead.
+
+   The documented alternative is a pod with the volume mounted, running `download_weights.py` directly. That is
+   worth knowing about and did not work here: pods were rented and billed with their container never starting
+   (`RUNNING`, `uptimeInSeconds: 0`, no ports) across two datacentres and two GPU types, while serverless
+   workers on the same account start normally. Hence `mode: "setup"`.
+
+   Note for anyone using a pod anyway: a pod mounts the volume at its `volumeMountPath`, which defaults to
+   `/workspace`. Only serverless sees it at `/runpod-volume`, so pass `volumeMountPath: "/runpod-volume"` or the
+   download lands on the container disk and runs out of room.
 
 3. **Deploy from the RunPod Hub**, attach the volume, and raise the endpoint's execution timeout — the default
    is 10 minutes and a long video is not.
