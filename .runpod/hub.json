@@ -7,7 +7,7 @@
   "config": {
     "runsOn": "GPU",
     "containerDiskInGb": 30,
-    "gpuIds": "AMPERE_80,ADA_80_PRO,AMPERE_48",
+    "gpuIds": "AMPERE_80",
     "gpuCount": 1,
     "presets": [],
     "env": [

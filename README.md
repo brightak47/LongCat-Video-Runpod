@@ -17,9 +17,18 @@ hour pulling the first time a worker lands on a new machine. They live on a netw
    query { dataCenters { id storageSupport gpuAvailability { gpuTypeId available stockStatus } } }
    ```
 
-   As of writing `EUR-IS-1` is the only storage datacentre with any 80 GB-class card above `Low` stock (the
-   RTX PRO 6000 Blackwell 96 GB at `Medium`). A100 80 GB PCIe exists only in `CA-MTL-3`, where it could not
-   actually be allocated.
+   **Which card matters more than how much of it there is.** LongCat pins torch 2.6.0 + CUDA 12.4 and
+   flash-attn 2.7.4.post1, a stack with no `sm_120` kernels, so the RTX PRO 6000 Blackwell 96 GB cannot run
+   this image at all -- it will download the weights and then fail every generation with "no kernel image is
+   available for execution on the device". That is the only card above `Low` stock anywhere, and it is the one
+   card to avoid. `gpuIds` is therefore `AMPERE_80` (A100 80 GB), which is what the pinned stack supports.
+
+   As of writing `EU-RO-1` is the best home: it is the only storage datacentre carrying two compatible cards,
+   A100 80 GB PCIe and A100 SXM 80 GB, so a job has two chances of a worker rather than one. Running the
+   Blackwell would mean moving to torch 2.8 + cu12.8 and a newer flash-attn, away from the project's pins.
+
+   Put the studio's uploads on this same volume. An endpoint mounts exactly one, so inputs for
+   image-to-video and continuation have to live on the volume the worker already has.
 
 2. **Populate it once**, by asking the endpoint to do it:
 
