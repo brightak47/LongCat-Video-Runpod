@@ -1,0 +1,19 @@
+{
+  "tests": [
+    {
+      "name": "text_to_video",
+      "input": {
+        "mode": "t2v",
+        "prompt": "realistic filming style, a hot air balloon rising slowly over green hills at sunrise, the camera tracking it from below",
+        "quality": "fast",
+        "segments": 0
+      },
+      "timeout": 1800
+    }
+  ],
+  "config": {
+    "gpuTypeId": "NVIDIA A100 80GB PCIe",
+    "gpuCount": 1,
+    "containerDiskInGb": 30
+  }
+}

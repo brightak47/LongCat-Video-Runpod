@@ -1,0 +1,59 @@
+{
+  "title": "LongCat-Video",
+  "description": "Text-to-video, image-to-video and video continuation with Meituan's LongCat-Video (13.6B, MIT). Weights load from an attached network volume, so this image stays small and cold starts are minutes rather than an hour.",
+  "type": "serverless",
+  "category": "video",
+  "iconUrl": "https://avatars.githubusercontent.com/u/180650897",
+  "config": {
+    "runsOn": "GPU",
+    "containerDiskInGb": 30,
+    "gpuIds": "AMPERE_80,ADA_80_PRO,AMPERE_48",
+    "gpuCount": 1,
+    "presets": [],
+    "env": [
+      {
+        "key": "CHECKPOINT_DIR",
+        "value": "/runpod-volume/weights/LongCat-Video",
+        "input": {
+          "name": "Checkpoint directory",
+          "type": "string",
+          "default": "/runpod-volume/weights/LongCat-Video",
+          "description": "Where the weights were downloaded on the attached volume."
+        }
+      },
+      {
+        "key": "R2_ACCOUNT_ID",
+        "input": {
+          "name": "R2 account id",
+          "type": "string",
+          "default": "",
+          "description": "Optional. Set the R2 group to have finished videos uploaded and a signed URL returned."
+        }
+      },
+      {
+        "key": "R2_BUCKET",
+        "input": {
+          "name": "R2 bucket",
+          "type": "string",
+          "default": ""
+        }
+      },
+      {
+        "key": "R2_ACCESS_KEY_ID",
+        "input": {
+          "name": "R2 access key id",
+          "type": "string",
+          "default": ""
+        }
+      },
+      {
+        "key": "R2_SECRET_ACCESS_KEY",
+        "input": {
+          "name": "R2 secret access key",
+          "type": "string",
+          "default": ""
+        }
+      }
+    ]
+  }
+}
